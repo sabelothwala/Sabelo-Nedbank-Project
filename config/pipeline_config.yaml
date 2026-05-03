@@ -1,0 +1,175 @@
+# ============================================================================
+# Pipeline configuration — Stage 1
+#
+# Loaded by pipeline.config.load_config(). Resolution order:
+#   1. $PIPELINE_CONFIG (env var, set in Dockerfile to /data/config/...)
+#   2. /data/config/pipeline_config.yaml  (scorer mount)
+#   3. /app/config/pipeline_config.yaml   (in-image fallback for local smoke)
+#
+# Stage 2/3 hooks are commented out, not removed — those stages enable them
+# in place rather than restructuring this file.
+# ============================================================================
+
+# ── Mount paths ─────────────────────────────────────────────────────────────
+input:
+  customers_path:    /data/input/customers.csv
+  accounts_path:     /data/input/accounts.csv
+  transactions_path: /data/input/transactions.jsonl
+
+output:
+  bronze_path:     /data/output/bronze
+  silver_path:     /data/output/silver
+  gold_path:       /data/output/gold
+  quarantine_path: /data/output/silver/_quarantine
+  dq_report_path:  /data/output/dq_report.json   # Stage 2+
+
+# ── Run identity ────────────────────────────────────────────────────────────
+run:
+  # null = today (UTC). Used for age_band derivation; fixing this lets the
+  # scorer reproduce age_band values across runs.
+  run_date: null
+  # null = generated as yyyymmddTHHMMSSZ + 6-char hex suffix at startup.
+  batch_id: null
+  log_level: INFO
+
+# ── Sources ─────────────────────────────────────────────────────────────────
+# Single source of truth for per-source pipeline behaviour. Adding a new
+# source means adding an entry here, not editing pipeline code.
+sources:
+  customers:
+    source_system:    bank_crm
+    primary_key:      customer_id
+    dedup_keys:       [customer_id]   # tie-break: keep first by _ingested_at
+    schema_bronze:    BronzeCustomersSchema
+    schema_silver:    SilverCustomersSchema
+    bronze_partition: []              # 80k rows — single-partition Delta is fine
+    silver_partition: []
+  accounts:
+    source_system:    fintech_accounts
+    primary_key:      account_id
+    dedup_keys:       [account_id]
+    schema_bronze:    BronzeAccountsSchema
+    schema_silver:    SilverAccountsSchema
+    bronze_partition: []
+    silver_partition: []
+  transactions:
+    source_system:    fintech_events
+    primary_key:      transaction_id
+    dedup_keys:       [transaction_id]
+    schema_bronze:    BronzeTransactionsSchema
+    schema_silver:    SilverTransactionsSchema
+    # 1M rows in Stage 1, 3M in Stage 2. Bronze is written via streaming
+    # sink_parquet; we do NOT partition Bronze (a single Delta with the part
+    # files written by polars is fastest to scan once).
+    bronze_partition: []
+    # Silver also unpartitioned at this scale. If Stage 2 cardinality grows
+    # so DuckDB scans get slow, partition by transaction_date here — Polars
+    # writes are lazy w.r.t. partition cols.
+    silver_partition: []
+    # Streaming-write knob: Polars sink_parquet streams in row-group batches.
+    # Lowering this reduces peak RAM on the 2 GB cap; 100k is a safe default.
+    streaming_chunk_rows: 100000
+
+# ── Standardisation rules (Silver layer applies these) ──────────────────────
+standardisation:
+
+  # Currency normalisation. Stage 1 source already produces "ZAR" for every row,
+  # but the map exists today so Stage 2's variants drop in without code change.
+  # Lookup is done after .strip().upper() on the source value.
+  currency:
+    canonical: ZAR
+    accept:
+      "ZAR":   ZAR
+      "R":     ZAR
+      "RANDS": ZAR
+      "ZAR ":  ZAR
+      "710":   ZAR     # ISO 4217 numeric, delivered as integer in Stage 2 source
+    # If a source value falls outside `accept`, dq_flag=CURRENCY_VARIANT is
+    # set and the value is coerced to canonical. We never write a non-ZAR row.
+    on_unknown: flag_and_coerce
+
+  # Date format candidates tried in order. Stage 1 source is uniform YYYY-MM-DD;
+  # Stage 2 adds DD/MM/YYYY and Unix epoch integers. Polars str.to_date is
+  # invoked per format; the first successful parse wins. A row that fails all
+  # formats has dq_flag=DATE_FORMAT.
+  date_formats:
+    candidates:
+      - "%Y-%m-%d"
+      # - "%d/%m/%Y"   # Stage 2: enable
+      # - "epoch_s"    # Stage 2: enable; sentinel handled in code (Unix seconds)
+
+  # Province standardisation. Stage 1 sources use canonical names; map exists
+  # for Stage 2 typo / case variants.
+  province:
+    canonical:
+      - "Eastern Cape"
+      - "Free State"
+      - "Gauteng"
+      - "KwaZulu-Natal"
+      - "Limpopo"
+      - "Mpumalanga"
+      - "Northern Cape"
+      - "North West"
+      - "Western Cape"
+    aliases: {}   # Stage 2: e.g. {"KZN": "KwaZulu-Natal", "WC": "Western Cape"}
+
+# ── Gold layer derivation rules ─────────────────────────────────────────────
+gold:
+  age_band:
+    # output_schema_spec §4. Lower bound inclusive; the last bucket is open.
+    # Edge case: age < 18 should not occur in source data; if it does, age_band
+    # is set to null and a WARN is logged (do not silently drop the row).
+    buckets:
+      - {label: "18-25", min_age: 18, max_age: 25}
+      - {label: "26-35", min_age: 26, max_age: 35}
+      - {label: "36-45", min_age: 36, max_age: 45}
+      - {label: "46-55", min_age: 46, max_age: 55}
+      - {label: "56-65", min_age: 56, max_age: 64}
+      - {label: "65+",   min_age: 65, max_age: 200}
+
+  surrogate_keys:
+    # Per output_schema_spec §1: row_number() with stable ORDER BY on the
+    # natural key, OR sha2(natural_key) cast to BIGINT. We use row_number —
+    # avoids hash-collision risk at the BIGINT cast.
+    method: row_number_natural_key
+
+# ── Schema drift policy ─────────────────────────────────────────────────────
+# Three-tier policy applied at the Silver write step.
+#   strict      : pipeline exits non-zero on any unknown column
+#   quarantine  : unknown columns + their rows are diverted to <quarantine>/
+#                 <source>/, the in-band row is kept with the unknown columns
+#                 dropped, and a WARN is logged. THIS IS THE POPIA-ALIGNED DEFAULT.
+#   autoevolve  : unknown columns silently extend the schema (NOT recommended
+#                 for financial sources; never used here)
+drift:
+  policy: quarantine
+
+# ── DQ thresholds (Stage 2+ — informational in Stage 1) ─────────────────────
+dq:
+  enable: false                        # Stage 2 sets true
+  rules_path: /data/config/dq_rules.yaml   # Stage 2+
+  warn_threshold: 0.05                 # >5% of rows flagged for one issue → WARN
+  fail_threshold: 0.50                 # >50% → fatal (something is structurally wrong)
+  # Per output_schema_spec §8: only these 6 codes are accepted in dq_flag.
+  allowed_flags:
+    - ORPHANED_ACCOUNT
+    - DUPLICATE_DEDUPED
+    - TYPE_MISMATCH
+    - DATE_FORMAT
+    - CURRENCY_VARIANT
+    - NULL_REQUIRED
+
+# ── Validation harness (DuckDB) — runs after Gold provisioning ─────────────
+validation:
+  run_after_gold:    true
+  query_1_tolerance: 0.02   # ±2% per transaction_type count
+  query_2_tolerance: 0      # zero unlinked accounts (zero tolerance)
+  query_3_tolerance: 0.05   # ±5% per province count
+
+# ── Stage 3 streaming hooks (commented; enabled in Stage 3 only) ────────────
+# streaming:
+#   stream_input_path:        /data/stream
+#   stream_gold_path:         /data/output/stream_gold
+#   poll_interval_seconds:    10
+#   quiesce_timeout_seconds:  60
+#   max_recent_per_account:   50

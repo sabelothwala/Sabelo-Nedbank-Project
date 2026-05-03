@@ -1,0 +1,14 @@
+data/
+output/
+docs/
+infrastructure/
+starter_kit/
+.git/
+.DS_Store
+**/.DS_Store
+**/__pycache__/
+*.pyc
+.venv/
+venv/
+*.md
+!README.md

@@ -1,0 +1,28 @@
+# Stage 1 pipeline dependencies layered on nedbank-de-challenge/base:1.0.
+#
+# Base image already pins (do NOT re-pin here):
+#   pyspark==3.5.0  delta-spark==3.1.0  pandas==2.1.0  pyarrow==14.0.0
+#   pyyaml==6.0.1   duckdb==0.10.0
+#
+# Pin rules:
+#   - numpy<2: pyarrow 14.0.0 was compiled against numpy 1.x — importing
+#     pyarrow under numpy 2.x raises "numpy.core.multiarray failed to import".
+#     Dockerfile.base does NOT pin numpy and pip resolves 2.4.4, so even the
+#     bare base image cannot import pyarrow. We pin numpy<2 here to repair
+#     the base. We are NOT upgrading pyarrow (would break delta-spark per the
+#     base image's own warning).
+#   - polars: 0.20.x is the last series compatible with pyarrow 14.x.
+#     0.21+ requires pyarrow>=15 which would break delta-spark in the base.
+#   - deltalake: 0.15.x ships with pyarrow>=8,<16, so it accepts pyarrow 14.0.0.
+#     It uses an internal Rust engine — no JVM dependency, no Spark required.
+#   - pandera: native polars validation landed in 0.19.0. We pin 0.20.4 — it
+#     still accepts pyarrow 14 (no upper-bound conflict) and is the most stable
+#     release in the 0.20 line. Pandera 0.18.x has NO polars module despite
+#     accepting the [polars] extra, so the prior pin was a silent failure.
+#     Round-tripping the 1M-row Bronze frame through pandas to validate would
+#     blow the 2 GB cap, so polars-native validation is non-negotiable.
+
+numpy<2
+polars==0.20.31
+deltalake==0.15.3
+pandera[polars]==0.20.4

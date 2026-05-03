@@ -1,0 +1,29 @@
+# Pipeline artefacts — scorer provides its own output mount
+output/
+
+# Source data — scorer mounts its own dataset
+data/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+
+# Dev-only handoff prompts (not part of submission)
+HANDOFF_PHASE*.md
+MEMORY_OPTIMIZATION_BRIEF.md
+
+# Original challenge-pack files (not part of submission)
+README_FIRST.md
+MANIFEST.md
+data_pack_reference.txt
+starter_kit/
+infrastructure/
